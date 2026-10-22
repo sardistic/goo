@@ -192,7 +192,9 @@
   button.act:active { transform: scale(.96); }
   button.act.primary { background: var(--ink); color: var(--ground); border-color: var(--ink); }
   button.act:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
-  button.act.motion { grid-column: 1 / -1; }
+  button.act.motion { grid-column: span 2; }
+  button.act.sound { grid-column: 1 / -1; }
+  button.act.motion:not([hidden]) + .sound { grid-column: auto; }
   button.act.motion[aria-pressed="true"] { background: var(--accent); color: #fff; border-color: transparent; }
   button.act:disabled { opacity: .5; cursor: default; }
 
@@ -312,6 +314,7 @@
     <button class="act" id="btnShake" type="button">Shake plate</button>
     <button class="act" id="btnPoke" type="button">Poke</button>
     <button class="act motion" id="btnMotion" type="button" hidden>Tilt &amp; shake phone</button>
+    <button class="act sound" id="btnSound" type="button" aria-pressed="true">Sound on</button>
   </div>
 </aside>
 
@@ -618,7 +621,7 @@ const grab = { active: false, idx: [], w: [], off: [], target: new THREE.Vector3
 let simTime = 0;
 // Plastic flow only runs while the body is being worked (grabbed, poked, thrown, hit hard),
 // plus a constant trickle for slime. Self-weight alone never makes it flow, so it can't melt.
-let disturb = 0, plasticGate = 0;
+let disturb = 0, plasticGate = 0, hitV = 0; // hitV: fastest floor landing since the sound engine last looked
 const kick = (v = 1) => { disturb = Math.max(disturb, v); };
 
 function step(dt) {
@@ -756,7 +759,8 @@ function step(dt) {
     const o = 3 * i;
     const fy = floorAt(XP[o], XP[o + 2]) + PR;
     const pen = fy - XP[o + 1];
-    if (pen > 0) { XP[o + 1] = fy; CONTACT[i] = 1; PEN[i] = pen; if (PRE[i] < -6) disturb = Math.max(disturb, Math.min(1, -PRE[i] / 14)); } else { CONTACT[i] = 0; PEN[i] = 0; }
+    const was = CONTACT[i];
+    if (pen > 0) { XP[o + 1] = fy; CONTACT[i] = 1; PEN[i] = pen; if (PRE[i] < -6) disturb = Math.max(disturb, Math.min(1, -PRE[i] / 14)); if (!was) hitV = Math.max(hitV, -PRE[i]); } else { CONTACT[i] = 0; PEN[i] = 0; }
     const r = Math.hypot(XP[o], XP[o + 2]);
     if (r > 7) { XP[o] *= 7 / r; XP[o + 2] *= 7 / r; }
   }
@@ -1583,6 +1587,131 @@ $('btnFling').addEventListener('click', () => {
 });
 
 /* ================================================================== *
+ * Sound + haptics, read off the sim every frame
+ * ================================================================== */
+// Nothing is sampled. The body's voice is a tone pitched by bloom whose pitch and level ride its real
+// squash and stretch, a noise squelch driven by internal motion, and a thud on every landing that rings
+// as long as the wobble decay allows. On Android the same signals buzz: a pulse per wobble, a knock per landing.
+// tuned against the sim: a drop wobbles ~0.05-0.2 of body height, a plate shake ~0.03; internal speed peaks ~5 on landing
+const FEEL = { hitV: 3, buzzW: 0.015, buzzK: 300, humW: 0.1, sqE: 5, bend: 1.5 };
+const btnSound = $('btnSound'), canBuzz = typeof navigator.vibrate === 'function' && matchMedia('(pointer: coarse)').matches;
+const feel = { on: true, ctx: null, body: null, mid: 0, restH: 1, avg: [0, 0, 0], dir: [1, 0, 0], wPrev: 0, wAmp: 0, lastHit: 0, lastBuzz: 0 };
+try { feel.on = localStorage.getItem('wobble-sound') !== 'off'; } catch {}
+function soundLabel() {
+  btnSound.setAttribute('aria-pressed', String(feel.on));
+  btnSound.textContent = (canBuzz ? 'Sound & buzz ' : 'Sound ') + (feel.on ? 'on' : 'off');
+}
+soundLabel();
+function startAudio() {
+  if (!feel.on) return;
+  if (feel.ctx) { if (feel.ctx.state !== 'running') feel.ctx.resume(); return; }
+  const AC = window.AudioContext || window.webkitAudioContext;
+  if (!AC) return;
+  const ctx = feel.ctx = new AC();
+  feel.out = ctx.createDynamicsCompressor();
+  feel.out.connect(ctx.destination);
+  // body tone
+  feel.hum = ctx.createOscillator(); feel.hum.type = 'triangle';
+  const lp = ctx.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 1100;
+  feel.humG = ctx.createGain(); feel.humG.gain.value = 0;
+  feel.hum.connect(lp).connect(feel.humG).connect(feel.out); feel.hum.start();
+  // squelch: looped noise through a resonant bandpass
+  const nb = feel.noise = ctx.createBuffer(1, ctx.sampleRate * 2, ctx.sampleRate), d = nb.getChannelData(0);
+  for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
+  const src = ctx.createBufferSource(); src.buffer = nb; src.loop = true;
+  feel.sq = ctx.createBiquadFilter(); feel.sq.type = 'bandpass';
+  feel.sqG = ctx.createGain(); feel.sqG.gain.value = 0;
+  src.connect(feel.sq).connect(feel.sqG).connect(feel.out); src.start();
+}
+addEventListener('pointerdown', startAudio, { capture: true });
+addEventListener('keydown', startAudio, { capture: true });
+document.addEventListener('visibilitychange', () => { if (!feel.ctx) return; if (document.hidden) feel.ctx.suspend(); else if (feel.on) feel.ctx.resume(); });
+btnSound.addEventListener('click', () => {
+  feel.on = !feel.on;
+  try { localStorage.setItem('wobble-sound', feel.on ? 'on' : 'off'); } catch {}
+  soundLabel();
+  if (feel.on) startAudio(); else feel.ctx?.suspend();
+});
+function thud(v, f0, ring, wet) {
+  const ctx = feel.ctx, t = ctx.currentTime, a = clamp(v / 14, 0, 1);
+  const o = ctx.createOscillator(), g = ctx.createGain();
+  o.frequency.setValueAtTime(f0 * (0.8 + a * 0.6), t);
+  o.frequency.exponentialRampToValueAtTime(f0 * 0.45, t + ring);
+  g.gain.setValueAtTime(0, t);
+  g.gain.linearRampToValueAtTime(0.55 * a, t + 0.006);
+  g.gain.setTargetAtTime(0, t + 0.006, ring / 3);
+  o.connect(g).connect(feel.out); o.start(t); o.stop(t + ring * 2 + 0.05);
+  // the splat on contact: a short burst of filtered noise, longer and wetter for plastic bodies
+  const n = ctx.createBufferSource(), f = ctx.createBiquadFilter(), ng = ctx.createGain();
+  n.buffer = feel.noise; f.type = 'lowpass'; f.frequency.value = 700 + 1800 * a;
+  ng.gain.setValueAtTime(0.35 * a * (0.5 + wet), t);
+  ng.gain.setTargetAtTime(0, t, 0.015 + 0.04 * wet);
+  n.connect(f).connect(ng).connect(feel.out); n.start(t, Math.random() * 1.5); n.stop(t + 0.3);
+}
+function buzz(ms, now) {
+  if (!canBuzz || !feel.on || now - feel.lastBuzz < 0.07) return;
+  feel.lastBuzz = now;
+  try { navigator.vibrate(Math.round(ms)); } catch {}
+}
+// call after finalizeFrames(), while R and uBodyC still hold the whole body's rigid fit
+function feelFrame(dt) {
+  const { N, X, V, rest, c0g } = B;
+  if (feel.body !== B) {
+    let rl = Infinity, rh = -Infinity;
+    for (let i = 0; i < N; i++) { rl = Math.min(rl, rest[3 * i + 1]); rh = Math.max(rh, rest[3 * i + 1]); }
+    feel.body = B; feel.mid = (rl + rh) / 2; feel.restH = rh - rl; feel.avg = [0, 0, 0];
+  }
+  // wobble: how far the top half has moved off the rigid fit (sway and squash alike), and motion relative to the bulk
+  const c = uBodyC.value;
+  let dx = 0, dy = 0, dz = 0, n = 0, mx = 0, my = 0, mz = 0;
+  for (let i = 0; i < N; i++) {
+    const o = 3 * i;
+    mx += V[o]; my += V[o + 1]; mz += V[o + 2];
+    if (rest[o + 1] < feel.mid) continue;
+    const qx = rest[o] - c0g[0], qy = rest[o + 1] - c0g[1], qz = rest[o + 2] - c0g[2];
+    dx += X[o] - (R[0] * qx + R[1] * qy + R[2] * qz + c.x);
+    dy += X[o + 1] - (R[3] * qx + R[4] * qy + R[5] * qz + c.y);
+    dz += X[o + 2] - (R[6] * qx + R[7] * qy + R[8] * qz + c.z);
+    n++;
+  }
+  mx /= N; my /= N; mz /= N;
+  let e = 0;
+  for (let i = 0; i < N; i++) { const o = 3 * i, a = V[o] - mx, b = V[o + 1] - my, cc = V[o + 2] - mz; e += a * a + b * b + cc * cc; }
+  e = Math.sqrt(e / N);
+  // measured against where it is settling (sag under gravity, a dent in dough), so only the motion counts
+  const sc = 1 / (n * feel.restH), A = feel.avg, k = Math.min(1, dt * 2);
+  dx *= sc; dy *= sc; dz *= sc;
+  A[0] += (dx - A[0]) * k; A[1] += (dy - A[1]) * k; A[2] += (dz - A[2]) * k;
+  const wx = dx - A[0], wy = dy - A[1], wz = dz - A[2], amp = Math.hypot(wx, wy, wz);
+  // signed along whichever axis it is swinging on
+  const D = feel.dir;
+  if (amp > 1e-4) {
+    const sg = wx * D[0] + wy * D[1] + wz * D[2] < 0 ? -1 : 1, kd = Math.min(1, dt * 3);
+    D[0] += (sg * wx / amp - D[0]) * kd; D[1] += (sg * wy / amp - D[1]) * kd; D[2] += (sg * wz / amp - D[2]) * kd;
+    const l = Math.hypot(D[0], D[1], D[2]) || 1; D[0] /= l; D[1] /= l; D[2] /= l;
+  }
+  const w = wx * D[0] + wy * D[1] + wz * D[2];
+  feel.wAmp = Math.max(amp, feel.wAmp * Math.exp(-dt * 5));
+  const hit = hitV; hitV = 0;
+
+  const now = performance.now() / 1000, wet = params.yieldS > 0 ? 1 : 0;
+  if (w >= 0 && feel.wPrev < 0 && feel.wAmp > FEEL.buzzW) buzz(clamp(feel.wAmp * FEEL.buzzK, 8, 35), now);
+  feel.wPrev = w;
+  if (hit > FEEL.hitV && now - feel.lastHit > 0.06) buzz(clamp(10 + hit * 3, 10, 60), now);
+
+  if (!feel.ctx || feel.ctx.state !== 'running') { if (hit > FEEL.hitV) feel.lastHit = now; return; }
+  const t = feel.ctx.currentTime, bloom = +$('bloom').value, decay = +$('decay').value;
+  const f0 = 150 * Math.pow(2, (bloom - 80) / 150);
+  const wob = clamp(feel.wAmp / FEEL.humW, 0, 1), en = Math.sqrt(clamp(e / FEEL.sqE, 0, 1));
+  feel.hum.frequency.setTargetAtTime(f0 * Math.pow(2, -w * FEEL.bend), t, 0.01);
+  feel.humG.gain.setTargetAtTime(0.22 * Math.pow(wob, 1.3) * (wet ? 0.25 : 1), t, 0.03);
+  feel.sq.frequency.setTargetAtTime((wet ? 220 : 380) + (wet ? 900 : 2200) * en, t, 0.03);
+  feel.sq.Q.value = wet ? 2.5 : 5;
+  feel.sqG.gain.setTargetAtTime(0.5 * en * en * (wet ? 1.6 : 0.5), t, 0.04);
+  if (hit > FEEL.hitV && now - feel.lastHit > 0.06) { feel.lastHit = now; thud(hit, f0, 0.04 + 0.36 * (1 - decay / 100), wet); }
+}
+
+/* ================================================================== *
  * Boot + loop
  * ================================================================== */
 let viewShift = -1;
@@ -1624,6 +1753,7 @@ renderer.setAnimationLoop(() => {
   while (acc >= SDT && n < 12) { step(SDT); acc -= SDT; n++; }
   if (n === 12) acc = 0;
   finalizeFrames();
+  feelFrame(fdt);
   skinMesh();
   if (bubbles.visible) skinBubbles();
   const lift = updateDecals();
